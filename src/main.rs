@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, bail, Context, ensure};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -14,6 +14,13 @@ static TWELFTH_ROOT_OF_TWO_POWERS: LazyLock<[f64; 12]> = LazyLock::new(|| {
         (8f64/12.).exp2(), (9f64/12.).exp2(), (10f64/12.).exp2(),        (11f64/12.).exp2()
     ]
 });
+
+fn calculate_sample_pitch(sample_rate: u32, base_note: i16) -> u32 {
+    let sample_rate_float = f64::from(sample_rate);
+    let pitch_factor = (f64::from(60 - base_note)/12.).exp2() * 1024.;
+    let calculated_sample_pitch = ((sample_rate_float * pitch_factor).round()) as u32;
+    calculated_sample_pitch
+}
 
 /// Returns lhs.rem_ieee(1.).abs(), where x.rem_ieee(y) is the IEEE-754
 /// operation "remainder(x, y)" (which isn't available in Rust, seemingly).
@@ -77,8 +84,7 @@ fn guess_base_note_from_sample_pitch(sample_pitch: u32, min_rate: u32) -> Option
     let best_sample_rate_int = best_sample_rate.round() as u32;
     // Verify that this best sample rate + base note actually gives us back the
     // right pitch value
-    let pitch_factor = (f64::from(60 - base_note)/12.).exp2() * 1024.;
-    let calculated_sample_pitch = ((f64::from(best_sample_rate_int) * pitch_factor).round()) as u32;
+    let calculated_sample_pitch = calculate_sample_pitch(best_sample_rate_int, base_note);
     if calculated_sample_pitch == sample_pitch {
         return Some((best_sample_rate_int, base_note.try_into().unwrap()));
     }
@@ -167,7 +173,7 @@ fn convert_to_wav(gba_sample: &[u8], min_rate: u32) -> Result<(Vec<u8>, u8), any
         // dwIdentifier -- name of the chunk. I think this is optional...?
         wav.extend_from_slice(&0u32.to_le_bytes());
         // dwType -- normal loop forward
-        wav.extend_from_slice(&1u32.to_le_bytes());
+        wav.extend_from_slice(&0u32.to_le_bytes());
         // dwStart -- loop start point
         wav.extend_from_slice(&loop_start.to_le_bytes());
         // dwEnd -- loop end point
@@ -193,6 +199,138 @@ fn convert_to_wav(gba_sample: &[u8], min_rate: u32) -> Result<(Vec<u8>, u8), any
     }
     
     Ok((wav, base_note))
+}
+
+fn convert_to_gba(wav_sample: &[u8], base_note: u8) -> Result<Vec<u8>, anyhow::Error> {
+    ensure!(wav_sample.len() >= 12 + 8 + 16 + 8, "WAV file isn't long enough to read metadata properly");
+    ensure!(&wav_sample[0..4] == b"RIFF", "File is not a WAV file (bad RIFF form magic)");
+    ensure!(u32::from_le_bytes(wav_sample[4..8].try_into().unwrap()).wrapping_add(8) == u32::try_from(wav_sample.len())?, "WAV size is wrong");
+    ensure!(&wav_sample[8..12] == b"WAVE", "File is not a WAV file (other type of RIFF form)");
+    
+    let mut sample_rate: Option<u32> = None;
+    let mut loop_points: Option<(u32, u32)> = None;
+    let mut audio_data: Option<Vec<u8>> = None;
+    let mut cursor = 12usize;
+    while cursor < wav_sample.len() {
+        if wav_sample.len() - cursor < 8 {
+            bail!("Not enough data left in WAV file for chunk metadata");
+        }
+        let chunk_magic = &wav_sample[cursor..cursor+4];
+        let chunk_size = u32::from_le_bytes(wav_sample[cursor+4..cursor+8].try_into().unwrap());
+        let chunk_size_usize = usize::try_from(chunk_size).unwrap();
+        if wav_sample.len() - (cursor + 8) < chunk_size_usize {
+            bail!("Not enough data left in WAV file for {:?} chunk data", chunk_magic);
+        }
+        let chunk = &wav_sample[cursor+8..cursor+8+chunk_size_usize];
+        
+        // Handle stuff from known chunks
+        match chunk_magic {
+            b"fmt " => {
+                ensure!(sample_rate.is_none(), "Multiple fmt chunks in .wav file");
+                ensure!(chunk_size == 0x10, "fmt chunk in .wav file has length {} (expected 16; extended WAV headers aren't supported)", chunk_size);
+                let format_tag = u16::from_le_bytes(chunk[0..2].try_into().unwrap());
+                ensure!(format_tag == 1, "WAV file does not contain uncompressed PCM audio (expected: 1; actual: {}", format_tag);
+                let channels = u16::from_le_bytes(chunk[2..4].try_into().unwrap());
+                ensure!(channels == 1, "WAV file has {} channels of audio, expected 1. Make it mono please.", channels);
+                let samples_per_sec = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                let avg_bytes_per_sec = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                let block_align = u16::from_le_bytes(chunk[12..14].try_into().unwrap());
+                let bits_per_sample = u16::from_le_bytes(chunk[14..16].try_into().unwrap());
+                ensure!(bits_per_sample == 8, "Unsupported bit depth {}. This tool only supports 8-bit WAVs.", bits_per_sample);
+                
+                let bytes_per_sample: u16 = (bits_per_sample + 7) / 8;
+                let channels_u32 = u32::from(channels);
+                ensure!(u32::from(bytes_per_sample) * samples_per_sec * channels_u32 == avg_bytes_per_sec, "WAV metadata is inconsistent");
+                ensure!(channels * bytes_per_sample == block_align, "WAV alignment metadata is inconsistent");
+                
+                sample_rate = Some(samples_per_sec);
+            }
+            b"smpl" => {
+                ensure!(loop_points.is_none(), "Multiple smpl chunks in .wav file");
+                ensure!(chunk_size >= 36, "smpl chunk isn't long enough to read metadata (expected length: 36+; actual length: {}", chunk_size);
+                // We don't really care about most of these fields.
+                // Verifying sample_period is also probably more error-prone than verifying other
+                // fields, since it's designed to make differing from the nominal sample rate
+                // possible...
+                
+                // let manufacturer = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+                // let product = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                // let sample_period = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                // let midi_unity_note = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
+                // let midi_pitch_fraction = u32::from_le_bytes(chunk[16..20].try_into().unwrap());
+                // let smpte_format = u32::from_le_bytes(chunk[20..24].try_into().unwrap());
+                // let smpte_offset = u32::from_le_bytes(chunk[24..28].try_into().unwrap());
+                let sample_loops_count = u32::from_le_bytes(chunk[28..32].try_into().unwrap());
+                ensure!(sample_loops_count >= 1, "No sample loops in smpl chunk. Why is it even here?");
+                let sampler_data_byte_count = u32::from_le_bytes(chunk[32..36].try_into().unwrap());
+                ensure!(chunk_size == 36 + sample_loops_count * 24 + sampler_data_byte_count, "smpl chunk size metadata is inconsistent");
+                
+                // Read the first loop in the sampler-loops data and hope that it's the right one.
+                // let identifier = u32::from_le_bytes(chunk[36..40].try_into().unwrap());
+                let type_ = u32::from_le_bytes(chunk[40..44].try_into().unwrap());
+                ensure!(type_ == 0, "Sampler loop uses weird loop type");
+                let loop_start = u32::from_le_bytes(chunk[44..48].try_into().unwrap());
+                let loop_end = u32::from_le_bytes(chunk[48..52].try_into().unwrap());
+                let fraction = u32::from_le_bytes(chunk[52..56].try_into().unwrap());
+                // let play_count = u32::from_le_bytes(chunk[56..60].try_into().unwrap());
+                ensure!(loop_start < loop_end, "Loop starting point exceeds loop ending point");
+                ensure!(fraction == 0, "Sampler loop involves fractional positions");
+                if let Some(ref mut audio_data_unwrapped) = audio_data {
+                    let loop_end_usize = usize::try_from(loop_end).unwrap();
+                    ensure!(loop_end_usize <= audio_data_unwrapped.len(), "Loop end point lies outside of sample");
+                    for _ in loop_end_usize..audio_data_unwrapped.len() {
+                        _ = audio_data_unwrapped.pop();
+                    }
+                }
+                
+                loop_points = Some((loop_start, loop_end));
+            }
+            b"data" => {
+                ensure!(sample_rate.is_some(), "No fmt chunk before data chunk");
+                ensure!(audio_data.is_none(), "Multiple data chunks in .wav file");
+                
+                let mut audio_data_limit = chunk_size_usize;
+                if let Some((_, loop_end)) = loop_points {
+                    ensure!(loop_end <= chunk_size, "Loop end point lies outside of sample");
+                    audio_data_limit = usize::try_from(loop_end).unwrap();
+                }
+                
+                let mut audio_data_vec = Vec::<u8>::with_capacity(audio_data_limit);
+                for b in &chunk[0..audio_data_limit] {
+                    // Convert unsigned 8-bit PCM to signed 8-bit PCM by subtracting 0x80
+                    audio_data_vec.push(b ^ 0x80);
+                }
+                audio_data = Some(audio_data_vec);
+            }
+            _ => {}
+        }
+        
+        cursor += 8;
+        cursor += chunk_size_usize;
+    }
+    
+    ensure!(sample_rate.is_some(), "No fmt chunk in .wav file");
+    ensure!(audio_data.is_some(), "No data chunk in .wav file");
+    
+    // Now... we write the GBA sample data
+    let audio_data = audio_data.unwrap();
+    let mut output = Vec::<u8>::with_capacity(audio_data.len() + 0x11);
+    output.extend_from_slice(b"\x00\x00\x00\x00");
+    output.extend_from_slice(&calculate_sample_pitch(sample_rate.unwrap(), base_note.into()).to_le_bytes()[..]);
+    if let Some((loop_start, _)) = loop_points {
+        output[3] = 0x40;
+        output.extend_from_slice(&loop_start.to_le_bytes()[..]);
+    } else {
+        output.extend_from_slice(b"\x00\x00\x00\x00");
+    }
+    output.extend_from_slice(&u32::try_from(audio_data.len()).unwrap().to_le_bytes()[..]);
+    output.extend_from_slice(&audio_data[..]);
+    output.push(if let Some((loop_start, _)) = loop_points {
+        audio_data[usize::try_from(loop_start).unwrap()]
+    } else {
+        0
+    });
+    Ok(output)
 }
 
 struct ArgsNormal {
@@ -304,19 +442,34 @@ fn main() -> Result<(), anyhow::Error> {
     let in_path = an.in_path;
     let out_path = an.out_path;
     let min_rate = an.min_rate;
-    let _base_note = an.base_note;
+    let base_note = an.base_note;
     
-    // Load all data from in_path
-    let infile_data = std::fs::read(&in_path)
-        .with_context(|| format!("Failed to read sample from {:?}", in_path))?;
-    
-    let (wav_data, base_note) = convert_to_wav(&infile_data[..], min_rate)
-        .with_context(|| format!("Failed to convert sample data from file {:?}", in_path))?;
-    
-    println!("Base note: {}{}", NOTE_NAMES[usize::from(base_note) % 12], base_note / 12 - 1);
-    
-    std::fs::write(&out_path, wav_data)
-        .with_context(|| format!("Failed to write WAV to {:?}", out_path))?;
-    
+    if let Some(in_ext) = in_path.extension() {
+        // Load all data from in_path
+        let infile_data = std::fs::read(&in_path)
+            .with_context(|| format!("Failed to read sample from {:?}", in_path))?;
+        
+        if in_ext == Path::new("wav") {
+            // Convert to GBA format
+            let gba_sample = convert_to_gba(&infile_data[..], base_note)
+                .with_context(|| format!("Failed to convert sample data from file {:?}", in_path))?;
+            
+            std::fs::write(&out_path, gba_sample)
+                .with_context(|| format!("Failed to write BIN to {:?}", out_path))?;
+        } else if in_ext == Path::new("bin") {
+            // Convert to WAV format
+            let (wav_data, base_note) = convert_to_wav(&infile_data[..], min_rate)
+                .with_context(|| format!("Failed to convert sample data from file {:?}", in_path))?;
+            
+            println!("Base note: {}{}", NOTE_NAMES[usize::from(base_note) % 12], base_note / 12 - 1);
+            
+            std::fs::write(&out_path, wav_data)
+                .with_context(|| format!("Failed to write WAV to {:?}", out_path))?;
+        } else {
+            bail!("Unrecognized input file extension '{:?}' -- expected 'bin' or 'wav'", in_ext);
+        }
+    } else {
+        bail!("Input file name has no file extension. Please rename the file to <name>.wav or <name>.bin as appropriate.");
+    }
     Ok(())
 }
