@@ -176,8 +176,8 @@ fn convert_to_wav(gba_sample: &[u8], min_rate: u32) -> Result<(Vec<u8>, u8), any
         wav.extend_from_slice(&0u32.to_le_bytes());
         // dwStart -- loop start point
         wav.extend_from_slice(&loop_start.to_le_bytes());
-        // dwEnd -- loop end point
-        wav.extend_from_slice(&sample_size.to_le_bytes());
+        // dwEnd -- loop end point (inclusive in WAV files!)
+        wav.extend_from_slice(&(sample_size - 1).to_le_bytes());
         // dwFraction -- no
         wav.extend_from_slice(&0u32.to_le_bytes());
         // dwPlayCount -- infinite loop
@@ -273,12 +273,12 @@ fn convert_to_gba(wav_sample: &[u8], base_note: u8) -> Result<Vec<u8>, anyhow::E
                 let loop_end = u32::from_le_bytes(chunk[48..52].try_into().unwrap());
                 let fraction = u32::from_le_bytes(chunk[52..56].try_into().unwrap());
                 // let play_count = u32::from_le_bytes(chunk[56..60].try_into().unwrap());
-                ensure!(loop_start < loop_end, "Loop starting point exceeds loop ending point");
+                ensure!(loop_start <= loop_end, "Loop starting point exceeds loop ending point");
                 ensure!(fraction == 0, "Sampler loop involves fractional positions");
                 if let Some(ref mut audio_data_unwrapped) = audio_data {
                     let loop_end_usize = usize::try_from(loop_end).unwrap();
-                    ensure!(loop_end_usize <= audio_data_unwrapped.len(), "Loop end point lies outside of sample");
-                    for _ in loop_end_usize..audio_data_unwrapped.len() {
+                    ensure!(loop_end_usize < audio_data_unwrapped.len(), "Loop end point lies outside of sample");
+                    for _ in loop_end_usize..audio_data_unwrapped.len() - 1 {
                         _ = audio_data_unwrapped.pop();
                     }
                 }
@@ -291,14 +291,15 @@ fn convert_to_gba(wav_sample: &[u8], base_note: u8) -> Result<Vec<u8>, anyhow::E
                 
                 let mut audio_data_limit = chunk_size_usize;
                 if let Some((_, loop_end)) = loop_points {
-                    ensure!(loop_end <= chunk_size, "Loop end point lies outside of sample");
-                    audio_data_limit = usize::try_from(loop_end).unwrap();
+                    ensure!(loop_end < chunk_size, "Loop end point lies outside of sample");
+                    audio_data_limit = usize::try_from(loop_end).unwrap() + 1;
                 }
                 
                 let mut audio_data_vec = Vec::<u8>::with_capacity(audio_data_limit);
-                for b in &chunk[0..audio_data_limit] {
+                audio_data_vec.extend_from_slice(&chunk[0..audio_data_limit]);
+                for i in 0..audio_data_limit {
                     // Convert unsigned 8-bit PCM to signed 8-bit PCM by subtracting 0x80
-                    audio_data_vec.push(b ^ 0x80);
+                    audio_data_vec[i] ^= 0x80;
                 }
                 audio_data = Some(audio_data_vec);
             }
