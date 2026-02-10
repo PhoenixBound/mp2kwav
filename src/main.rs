@@ -22,19 +22,6 @@ fn calculate_sample_pitch(sample_rate: u32, base_note: i16) -> u32 {
     calculated_sample_pitch
 }
 
-/// Returns lhs.rem_ieee(1.).abs(), where x.rem_ieee(y) is the IEEE-754
-/// operation "remainder(x, y)" (which isn't available in Rust, seemingly).
-/// May round slightly worse than the real thing, but we don't need super high
-/// accuracy, so it works.
-fn abs_remainder_by_one(lhs: f64) -> f64 {
-    let frac = (lhs % 1.0).abs();
-    if frac > 0.5 {
-        1.0 - frac
-    } else {
-        frac
-    }
-}
-
 fn guess_base_note_from_sample_pitch(sample_pitch: u32, min_rate: u32) -> Option<(u32, u8)> {
     // Start at middle C
     let mut base_note = 60i16;
@@ -58,11 +45,14 @@ fn guess_base_note_from_sample_pitch(sample_pitch: u32, min_rate: u32) -> Option
     // Then figure out which of the 12 notes in the octave is closest to having
     // a whole-number sample rate
     // Starting with C
+    // (NOTE: libm::remainder isn't a %. This is an IEEE remainder operation.
+    //  It returns the difference from the nearest multiple of the divisor.
+    //  As of writing, this operation isn't exposed directly in Rust, as far as I know.)
     let mut best_note_name = 0u8;
-    let mut min_difference = abs_remainder_by_one(sample_rate);
+    let mut min_difference = libm::remainder(sample_rate, 1.0).abs();
     for i in 1u8..12 {
         let this_sample_rate = sample_rate * TWELFTH_ROOT_OF_TWO_POWERS[usize::from(i)];
-        let score = abs_remainder_by_one(this_sample_rate);
+        let score = libm::remainder(this_sample_rate, 1.0).abs();
         if score < min_difference {
             min_difference = score;
             best_note_name = i;
